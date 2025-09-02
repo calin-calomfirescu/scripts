@@ -579,6 +579,47 @@ get_recent_ips() {
     ' "$APACHE_ACCESS_LOG"
 }
 
+
+report_to_abuseipdb() {
+    local ip=$1
+    local request_count=$2
+    
+    if [[ -z "$ABUSEIPDB_API_KEY" ]]; then
+        log_message "Warning: Cannot report $ip to AbuseIPDB - API key not configured"
+        return 1
+    fi
+    
+    log_message "Reporting $ip to AbuseIPDB for excessive requests ($request_count requests)"
+    
+    # Categories: 21 = Bad Web Bot, 16 = DDoS Attack
+    local categories="21"
+    local comment="Automated blocking: $request_count requests in ${TIME_WINDOW}s detected by server monitoring"
+    
+    local response=$(curl -s -X POST https://api.abuseipdb.com/api/v2/report \
+        --data-urlencode "ip=$ip" \
+        --data-urlencode "categories=$categories" \
+        --data-urlencode "comment=$comment" \
+        -H "Key: $ABUSEIPDB_API_KEY" \
+        -H "Accept: application/json")
+    
+    if [[ $? -eq 0 ]]; then
+        # Check if report was successful
+        if echo "$response" | grep -q '"abuseConfidenceScore"'; then
+            log_message "Successfully reported $ip to AbuseIPDB"
+        elif echo "$response" | grep -q '"status":429'; then
+            log_message "Warning: AbuseIPDB rate limit exceeded - could not report $ip"
+        elif echo "$response" | grep -q '"errors":\['; then
+            local error_detail=$(echo "$response" | grep -o '"detail":"[^"]*"' | cut -d'"' -f4)
+            log_message "Warning: Failed to report $ip to AbuseIPDB: ${error_detail:-"Unknown error"}"
+        else
+            log_message "Warning: Unexpected response when reporting $ip to AbuseIPDB"
+        fi
+    else
+        log_message "Warning: Failed to connect to AbuseIPDB for reporting $ip"
+    fi
+}
+
+
 # Main monitoring function
 monitor_and_protect() {
     log_message "Starting IP protection monitoring"
@@ -616,6 +657,9 @@ monitor_and_protect() {
             if [[ $request_count -gt $MAX_REQUEST_THRESHOLD ]]; then
                 log_message "Extremely high activity detected: $ip ($request_count requests) - blocking immediately"
                 block_ip "$ip" "high_activity"
+
+                # Report to AbuseIPDB for bot behavior
+                report_to_abuseipdb "$ip" "$request_count"
             else
                 # Check AbuseIPDB reputation
                 local confidence
@@ -623,7 +667,6 @@ monitor_and_protect() {
                 confidence=$(check_abuseipdb "$ip")
                 api_result=$?
 
-                log_message "api_result $api_result"
                 if [[ $api_result -eq 2 ]]; then
                     log_message "Rate limit reached - skipping $ip for now"
                 elif [[ $api_result -eq 0 && -n "$confidence" && "$confidence" =~ ^[0-9]+$ ]]; then
